@@ -1,0 +1,85 @@
+ProjectName: 'CrossbatchLinear_96_4x/'
+Model: 'model/'  
+File: 'train_log/'
+Results: './results/'
+norm: 'zero2two'
+mean: 259.3117656881453 
+std: 362.1817760568698 
+line_search: False
+fine_tune: False
+use_lbfgs: False
+
+data:
+  return_id: True
+
+skip_timestep: False
+conditioning:
+  method: 'ps'
+  params:
+    scale: 0.5
+    use_lbfgs: False
+
+measurement:
+  operator:
+    name: 'noise'
+    #kernel_size: 11 #11 #5 #61
+    #intensity: 1.0 #1.0  #3.0
+  
+  noise: 
+    name: 'gaussian'
+    sigma: 0.001 #0.05
+
+Data:
+  groundtruth_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/train/*/T1w/*_groundtruth_norm.nii.gz'
+  lowres_path: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/train/*/T1w/lr_norm*.gz'
+  groundtruth_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/*_groundtruth_norm.nii.gz'
+  lowres_path_test: '/cluster/project0/IQT_Nigeria/skim/HCP_Harry_x4/valid/*/T1w/lr_norm*.gz'
+  groundtruth_fname: 'T1w_acpc_dc_restore_brain' 
+  mean: 23.746895931024163 #271.64814106698583 
+  std: 34.537307454196636 #377.117173547721 
+  mean_hr: 259.3117656881453 
+  std_hr: 362.1817760568698 
+  norm: 'z-score' #min-max
+
+Train:
+  pretrain: False
+  pred_obj: 'x_start'
+  timesteps: 1000
+  batch_sample: True #if True, extracts 96x96x96 then convert to 27x32x32x32
+  batch_sample_factor: 3
+  lpips: False
+  medlpips: False
+  boundary: False
+  att_type: 'linear'
+  att_mid: True
+  att_head_dim: 64 
+  att_mid_depth: 1
+  att_mid_heads: 8
+  att_enc: [True, True, True]
+  att_enc_depth: [1,1,1]
+  att_enc_heads: [8,8,8]
+  att_drop: 0.0
+  att_forward_drop: 0.0
+  att_forward_expansion: 2
+  num_groups: 1
+  att_localvit: False
+  skip_scale: False
+  emb_size: 256
+  efficient: False
+  patch_size_sub: 32
+  pretrain_model: '/cluster/project0/IQT_Nigeria/skim/diffusion/results/Base_4x/model/3dimagen.pt'
+  batch_size: 27
+  save_file: 'train_loss.csv'
+  save_model: '3dimagen.pt'
+  save_last_model: 'last_checkpoint.pt'
+  dynamic_threshold: False
+  use_se: True
+  deep_feature: True
+
+Eval:
+  batch_size: 27
+  repeat: 2
+  overlap: 48
+  save_file: 'valid_loss.csv'
+  save_file2: 'valid_loss_full.csv'
+  save_imgs: 'figures/'
