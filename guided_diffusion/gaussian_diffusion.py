@@ -472,7 +472,8 @@ class GaussianDiffusion:
         progress=False,
         skip_timesteps=None,
         skip_x0=None,
-        line_search=False
+        line_search=False,
+        patch_idx=None
     ):
         """
         Generate samples from the model.
@@ -508,7 +509,8 @@ class GaussianDiffusion:
             progress=progress,
             skip_timesteps=skip_timesteps,
             skip_x0=skip_x0,
-            line_search=line_search
+            line_search=line_search,
+            patch_idx=patch_idx
         ):
             final = sample
         return final["sample"]
@@ -528,7 +530,8 @@ class GaussianDiffusion:
         progress=False,
         skip_timesteps=False,
         skip_x0=None,
-        line_search=False
+        line_search=False,
+        patch_idx=None,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -611,6 +614,7 @@ class GaussianDiffusion:
                                         denoised_fn=denoised_fn,
                                         cond_fn=cond_fn,
                                         model_kwargs=model_kwargs,
+                                        patch_idx=patch_idx,
                                         device=device)
                 else:
                     #TODO: how can we handle argument for different condition method?
@@ -620,7 +624,8 @@ class GaussianDiffusion:
                                         x_prev=img,
                                         x_0_hat=out['pred_xstart'],
                                         t=t,
-                                        line_search=self.line_search)
+                                        line_search=self.line_search,
+                                        patch_idx=patch_idx)
                 img = img.detach_()
                 out['sample'] = img
 

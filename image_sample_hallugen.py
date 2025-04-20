@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import time
 from torchvision.transforms import Resize
 from PIL import Image
+from guided_diffusion.test_util import select_patch
 
 
 torch.backends.cudnn.enabled = False
@@ -70,12 +71,10 @@ def main():
     model.eval()
     print('Using device:', device)
 
-    save_path = '/cluster/project0/IQT_Nigeria/skim/DPS_hallu/'
-    #data_dir = '/cluster/project0/IQT_Nigeria/skim/HCP_Kim_x4_2D/Sig1.0Gam0.7DS04/test/test_small/*'#HCP_t1t2_ALL/sim/901038' #996782
-    #files = glob.glob(data_dir + '/gt.npy')
+    save_path = '/cluster/project0/IQT_Nigeria/skim/DPS_hallu_small/'
 
-    lst_files = ['901038','901139','901442','902242','904044','905147'] #['116120', '116221', '116423', '116524', '116726', '117021', '117122', '117324', '117728', '117930', '118023', '118124', '118225', '118528', '118730', '118831', '118932', '119025', '119126', '119732']
-    lst_files = lst_files[0:1]
+    lst_files = ['901038','901139','901442','902242','904044','905147','907656','908860'] #['116120', '116221', '116423', '116524', '116726', '117021', '117122', '117324', '117728', '117930', '118023', '118124', '118225', '118528', '118730', '118831', '118932', '119025', '119126', '119732']
+    #lst_files = lst_files[0:1]
     
     save_files_pred = {i: [] for i in lst_files}
     save_files_gt = {i: [] for i in lst_files}
@@ -141,14 +140,6 @@ def main():
         print(data_dict['file_id'][0], data_dict['slice_idx'].numpy()[0])
         fname_curr, slice_curr = int(data_dict['file_id'][0]), str(data_dict['slice_idx'].numpy()[0])
         print(fname_curr, slice_curr)
-        #data = np.load(f'/cluster/project0/IQT_Nigeria/skim/diffusion_inverse/guided-diffusion/cond_results/unet/ind/{fname_curr}/pred_{slice_curr}_axial.npy')[0]
-        #data = np.load(f'/cluster/project0/IQT_Nigeria/skim/sss/pred_all_{fname_curr}.npy')[int(slice_curr)]
-
-        # Denormalize
-        #data = data * std + mean
-        #data = np.clip(data, 0., 1.0)
-        #print("DATA shape")
-        #print(data.min(), data.max())
         
         #Inject noise
         if configs['skip_timestep']:
@@ -163,22 +154,14 @@ def main():
         #y_n = y_n.clmap(min=0., max=2.)
 
         # Augment measurement to generate intrinsic hallucination
-        idx_lst = [100, 164, 20, 84]#[55,87,115,147] #[55,105,115,165]
+        idx_lst, idx_size = select_patch(ref_img, size_min=8, size_max=25, bg_threshold=0.2)
+        patch_idx = [slice(idx_lst[0], idx_lst[0]+idx_size[0]), slice(idx_lst[1], idx_lst[1]+idx_size[1])]
+        print(f"Patch: {patch_idx}")
         
-        y_n_clone = y_n.clone()
+        mask = torch.zeros_like(ref_img)
+        mask[:, :, patch_idx[0], patch_idx[1]] = 1.0
         
-        measurement_patch = y_n[:, :, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]].cpu()
-        #Downsample the measurement
-        down_ratio = 1
-        trans_pixel = 0
-        measurement_patch_down = Resize((measurement_patch.shape[2]//down_ratio, measurement_patch.shape[3]//down_ratio), interpolation=Image.BILINEAR)(measurement_patch)
-        #Upsample the measurement
-        measurement_patch = Resize((measurement_patch.shape[2], measurement_patch.shape[3]), interpolation=Image.BILINEAR)(measurement_patch_down)
-        #measurement_patch = measurement_patch + 0.05 * torch.randn_like(measurement_patch)
-        #measurement_patch[:] = torch.rot90(measurement_patch,1,[2,3])
-        meausrement_patch = measurement_patch.clone()
-        measurement_patch = measurement_patch.to(device)
-        y_n_clone[:, :, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = measurement_patch
+        # y_n_clone = y_n.clone()
         #skip_x0 = y_n_clone
             
         sample_fn = (
@@ -188,13 +171,14 @@ def main():
         sample = sample_fn(
             model,
             (args.batch_size, 1, args.image_size, args.image_size),
-            measurement=y_n_clone.to(torch.float32),
+            measurement=y_n.to(torch.float32),
             measurement_cond_fn = measurement_cond_fn,
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
             skip_timesteps=configs['skip_timestep'],
             skip_x0=skip_x0,
-            line_search=configs['line_search']
+            line_search=configs['line_search'],
+            patch_idx=patch_idx
         )
         end = time.time()
         print("Inf time: ", end-start)
@@ -218,7 +202,7 @@ def main():
                 np.save(f'{save_path}/{data_dict["file_id"][j]}/pred_{data_dict["slice_idx"][j]}_axial.npy', sample[j].cpu().numpy())
                 np.save(f'{save_path}/{data_dict["file_id"][j]}/gt_{data_dict["slice_idx"][j]}_axial.npy', ref_img[j].cpu().numpy())
                 np.save(f'{save_path}/{data_dict["file_id"][j]}/lr_{data_dict["slice_idx"][j]}_axial.npy', y_n[j].cpu().numpy())
-                np.save(f'{save_path}/{data_dict["file_id"][j]}/lr_hallu_{data_dict["slice_idx"][j]}_axial.npy', y_n_clone[j].cpu().numpy())
+                np.save(f'{save_path}/{data_dict["file_id"][j]}/hallu_mask_{data_dict["slice_idx"][j]}_axial.npy', mask[j].cpu().numpy())
  
             #for j in range(args.batch_size):
             #    key = str(int(data_dict['file_id'][j].numpy()))
@@ -230,37 +214,7 @@ def main():
     time_lst = np.array(time_lst)
     print("Mean time: ", np.mean(time_lst))
     print("Std time: ", np.std(time_lst))
-    print("Saving the results in Numpy")
-    mini, maxi = 0.0, 1.0 
    
-    # Concatenate the results for each file and save
-    '''
-    for k, v in save_files_pred.items():
-        v = np.array(v)
-        v = np.clip(v, mini, maxi)
-        if not os.path.exists(f'{save_path}/{k}'):
-            os.makedirs(f'{save_path}/{k}')
-        np.save(f'{save_path}/{k}/pred_axial.npy', v)
-    for k, v in save_files_gt.items():
-        v = np.array(v)
-        np.save(f'{save_path}/{k}/gt_axial.npy', v)
-    for k, v in save_files_lr.items():
-        v = np.array(v)
-        np.save(f'{save_path}/{k}/lr_axial.npy', v)
-    '''
-    # concatenate all the images into a single numpy array
-    # arr = np.array(all_images)
-    # arr_ys = np.array(ys)
-    # arr_refs = np.array(refs)
-    
-    #arr = np.clip(arr, mini, maxi)
-    
-    # save the samples in a numpy file
-    # np.savez("samples_pred", arr)
-    # np.savez("samples_ys", arr_ys)
-    # np.savez("samples_refs", arr_refs)
-
-    # dist.barrier()
     logger.log("sampling complete")
 
 

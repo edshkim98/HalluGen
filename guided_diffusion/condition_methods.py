@@ -275,37 +275,19 @@ class ConditioningMethod(ABC):
     def project(self, data, noisy_measurement, **kwargs):
         return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
     
-    def grad_and_value(self, x_prev, x_0_hat, measurement, t, use_lbfgs, **kwargs):
+    def grad_and_value(self, x_prev, x_0_hat, measurement, t, **kwargs):
         if self.noiser.__name__ == 'gaussian':
 
             x_0_hat = x_0_hat.clamp(min=0., max=1.)  ############# Ensure x_0_hat is clamped safely
             # Augment measurement to generate intrinsic hallucination
             
-            idx_lst = [100, 164, 20, 84] #[55,105,115,165]
+            idx_lst = [100, 116, 20, 36] #[55,105,115,165]
             hallu_mask = torch.ones_like(measurement).to(device)
             hallu_mask[0,0,idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = 0.0
 
-            '''
-            measurement_patch = measurement[0, 0, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]].cpu().numpy()
-            measurement_patch = np.rot90(measurement_patch)
-            measurement_patch = np.expand_dims(measurement_patch,axis=0)
-            measurement_patch = np.expand_dims(measurement_patch,axis=0)
-            measurement_patch = measurement_patch.copy()
-            measurement_patch = torch.tensor(measurement_patch).to(device)
-            measurement[:, :, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = measurement_patch
-            '''
             pred_measurement = self.operator.forward(x_0_hat, **kwargs)
             #Downsample the pred_measurement
-            
-            down_ratio = 1
-            pred_measurement_patch = pred_measurement[:, :, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]]
-            pred_measurement_patch_down = Resize((int(pred_measurement_patch.shape[2]/down_ratio), int(pred_measurement_patch.shape[3]/down_ratio)), interpolation=Image.BILINEAR)(pred_measurement_patch)
-            pred_measurement_patch = Resize((pred_measurement_patch.shape[2], pred_measurement_patch.shape[3]), interpolation=Image.BILINEAR)(pred_measurement_patch_down)
-            #pred_measurement_patch = pred_measurement_patch + 0.05*torch.randn_like(pred_measurement_patch)
-   
-            #pred_measurement_patch[:] = torch.rot90(pred_measurement_patch,1,[2,3])#0.0
-            pred_measurement[:, :, idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = pred_measurement_patch
-            
+             
             #measurement = self.noiser(measurement)
                 
             difference = measurement - pred_measurement
@@ -377,8 +359,6 @@ class PosteriorSampling(ConditioningMethod):
         self.alpha = self.scale_original
         self.best_ls = 1000
         self.loss_df = pd.DataFrame(columns=['Time', 'Loss'])
-        self.use_lbfgs = kwargs.get('use_lbfgs', False)
-        #print(f"Using L-BFGS: {self.use_lbfgs}")
         
         self.csv_file = "./line_search_stepsize.csv"
         with open(self.csv_file, "w", newline="") as f:
@@ -411,7 +391,7 @@ class PosteriorSampling(ConditioningMethod):
             # Ensure x_prev tracks gradients
             #x_prev = x_prev.clone().detach().requires_grad_()  #############
             
-            norm_grad_new, norm_new = self.grad_and_value(x_prev=x_t_new, x_0_hat=x_0_hat_new, measurement=measurement, t=t, use_lbfgs=False, **kwargs)
+            norm_grad_new, norm_new = self.grad_and_value(x_prev=x_t_new, x_0_hat=x_0_hat_new, measurement=measurement, t=t, **kwargs)
            # assert len(torch.unique(norm_grad_new.cpu().detach())) > 1, f"Norm grad is zero: {torch.unique(norm_grad_new.cpu().detach())}"
 
             # Check Wolfe conditions
@@ -447,10 +427,10 @@ class PosteriorSampling(ConditioningMethod):
         # If no suitable step size is found, return the minimum step size
         return self.alpha #alpha_min
     
-    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, **kwargs):
+    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, patch_idx, **kwargs):
     # Compute initial gradient and norm
         #x_prev.requires_grad_()  ###############
-        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, use_lbfgs=self.use_lbfgs, **kwargs)
+        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, **kwargs)
         #Add t and norm to dataframe
         self.loss_df = self.loss_df.append({'Time': t.cpu().numpy()[0], 'Loss': norm.detach().cpu().numpy()}, ignore_index=True)
         #print(f"Loss at {t.cpu().detach().numpy()}: {norm}")
@@ -476,18 +456,15 @@ class PosteriorSampling(ConditioningMethod):
             #        writer.writerow([t, self.scale])
             #    print(f"Step size for final iteration {t}: {self.scale}")
 
-        idx_lst = [100,164,20,84] #[55,105,115,165]
+        #idx_lst = [100,108,20,28] #[55,105,115,165]
+        idx_lst = patch_idx
         hallu_mask = torch.ones_like(measurement).to(device)
-        hallu_mask[0,0,idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = 0.1
+        hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
         if self.apply_mask:
             norm_grad = norm_grad * hallu_mask
 
         x_t -= norm_grad * self.scale
-        #diff = measurement - x_0_hat
-        #extrinsic_loss = torch.linalg.norm(diff)
-        #x_t += extrinsic_loss * self.scale * 0.5
-        #if (t % 10 == 0) and (t <= 100):
-        #    np.save(f"x_pred_{t.detach().cpu().numpy()}.npy", x_0_hat.detach().cpu().numpy())
+
         #if t > 0:
         return x_t, norm
         #print("Returning best loss: ", self.best_ls)
