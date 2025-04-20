@@ -459,7 +459,12 @@ class PosteriorSampling(ConditioningMethod):
         #idx_lst = [100,108,20,28] #[55,105,115,165]
         idx_lst = patch_idx
         hallu_mask = torch.ones_like(measurement).to(device)
-        hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
+        
+        #there are multiple patches, so we need to loop through them
+        for i in range(len(idx_lst)):
+            #print("idx_lst: ", idx_lst[i][0].start, idx_lst[i][0].stop, idx_lst[i][1].start, idx_lst[i][1].stop)
+            hallu_mask[0,0,idx_lst[i][0], idx_lst[i][1]] = -0.05 #-0.1
+        #hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
         if self.apply_mask:
             norm_grad = norm_grad * hallu_mask
 

@@ -154,12 +154,30 @@ def main():
         #y_n = y_n.clmap(min=0., max=2.)
 
         # Augment measurement to generate intrinsic hallucination
-        idx_lst, idx_size = select_patch(ref_img, size_min=8, size_max=25, bg_threshold=0.2)
-        patch_idx = [slice(idx_lst[0], idx_lst[0]+idx_size[0]), slice(idx_lst[1], idx_lst[1]+idx_size[1])]
-        print(f"Patch: {patch_idx}")
+        num_hallu = np.random.randint(1, 5) # number of hallucinated patches in the image
+        patch_idx_lst = []
+        for j in range(num_hallu):
+            while True:
+                idx_lst, idx_size = select_patch(ref_img, size_min=8, size_max=25, bg_threshold=0.2)
+                
+                #if selected idx range is already in the list, skip
+                valid = True
+                if len(patch_idx_lst) > 0:
+                    for k in range(len(patch_idx_lst)):
+                        if (idx_lst[0] >= patch_idx_lst[k][0].start and idx_lst[0] <= patch_idx_lst[k][0].stop) and (idx_lst[1] >= patch_idx_lst[k][1].start and idx_lst[1] <= patch_idx_lst[k][1].stop):
+                            print("Patch already selected, retrying...")
+                            valid = False
+                            break
+                if valid:
+                    break                
+            
+            patch_idx = [slice(idx_lst[0], idx_lst[0]+idx_size[0]), slice(idx_lst[1], idx_lst[1]+idx_size[1])]
+            patch_idx_lst.append(patch_idx)
+            print(f"Patch: {patch_idx}")
         
         mask = torch.zeros_like(ref_img)
-        mask[:, :, patch_idx[0], patch_idx[1]] = 1.0
+        for j in range(num_hallu):
+            mask[:, :, patch_idx_lst[j][0], patch_idx_lst[j][1]] = 1.0
         
         # y_n_clone = y_n.clone()
         #skip_x0 = y_n_clone
@@ -178,7 +196,7 @@ def main():
             skip_timesteps=configs['skip_timestep'],
             skip_x0=skip_x0,
             line_search=configs['line_search'],
-            patch_idx=patch_idx
+            patch_idx=patch_idx_lst
         )
         end = time.time()
         print("Inf time: ", end-start)
