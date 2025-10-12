@@ -8,22 +8,23 @@ std: 362.1817760568698
 line_search: False
 fine_tune: False
 use_lbfgs: False
+extrinsic: True
+interpolate_nohallu: True
 
 data:
   return_id: True
 
-skip_timestep: False
+skip_timestep: 799
 conditioning:
   method: 'ps'
   params:
-    scale: 0.5
-    use_lbfgs: False
+    scale: 0.75
 
 measurement:
   operator:
-    name: 'noise'
-    #kernel_size: 11 #11 #5 #61
-    #intensity: 1.0 #1.0  #3.0
+    name: 'gaussian_blur' #'noise'
+    kernel_size: 11 #11 #5 #61
+    intensity: 1.0  #3.0
   
   noise: 
     name: 'gaussian'

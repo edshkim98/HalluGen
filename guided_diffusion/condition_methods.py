@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image.fid import FrechetInceptionDistance as FID
+
 import numpy as np
 import torch.nn as nn
 from timm import create_model
@@ -15,11 +17,103 @@ import warnings
 from torch.optim import LBFGS
 from torchvision.transforms import Resize
 from PIL import Image
+import nibabel as nib
+
+import sys
+from types import SimpleNamespace
+from torchvision import transforms
+
+sys.path.append('/SAN/medic/IQT_ScoreMatching/SAM-Med2D')
+
+from segment_anything import sam_model_registry
 
 warnings.filterwarnings("ignore")
 
 __CONDITIONING_METHOD__ = {}
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+np.random.seed(42)
+
+class SAMMed2DFeatExtractor(nn.Module):
+    """
+    Single-class version of your original code.
+    - Builds SAM-Med2D (vit_b by default) and keeps only the image encoder.
+    - forward expects x: [B, 3, 256, 256] (already preprocessed/normalized upstream).
+    - If you want a quick PIL-based resize to 256 and tensorize, call .preprocess().
+    """
+    def __init__(self,
+                 model_type: str = "vit_b",
+                 image_size: int = 256,
+                 sam_checkpoint: str = "/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth",
+                 encoder_adapter: bool = True):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.image_size = image_size
+
+        # --- Build args for SAM-Med2D (kept as in your original) ---
+        args = SimpleNamespace(
+            image_size=image_size,
+            sam_checkpoint=sam_checkpoint,
+            encoder_adapter=encoder_adapter
+        )
+
+        # --- Instantiate SAM-Med2D model and grab the encoder ---
+        builder = sam_model_registry[model_type]
+        sam = builder(args)                  # keeps your original builder(args) pattern
+        sam = sam.to(self.device).eval()
+        self.encoder = sam.image_encoder     # <- what your original wrapper wrapped
+
+        # (Optional) simple PIL-based preprocessor similar to your old snippet
+        self.to_pil = transforms.ToPILImage()
+        self.prep = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),           # -> [3,256,256] in [0,1]
+        ])
+
+    #@torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, 3, 256, 256]  (already batched & resized)
+        Returns: feature map [B, C, Hf, Wf]
+        """
+        x = x.to(self.device)
+        out = self.encoder(x)
+
+        # Handle dict vs tensor outputs (kept exactly as you had)
+        if isinstance(out, dict):
+            fmap = out.get('feat', out.get('x', out))
+        else:
+            fmap = out
+        return fmap
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Optional helper if you still want the old PIL path.
+        Accepts x: [B, 3, H, W] in [0,1] or [0,255]; returns [B, 3, 256, 256] in [0,1].
+        Note: SAM-Med2D typically expects further normalization upstream if required.
+        """
+
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)  # Convert grayscale to 3-channel by repeating
+
+        if x.dim() != 4 or x.size(1) != 3:
+            raise ValueError("preprocess expects [B,3,H,W]")
+
+        # Convert each sample via PIL -> resize -> ToTensor (kept simple like your original)
+        xs = []
+        for i in range(x.size(0)):
+            xi = x[i]
+            # Ensure uint8 for PIL if input is float
+            if xi.dtype.is_floating_point:
+                xi_01 = xi.clamp(0, 1)
+                pil = self.to_pil((xi_01 * 255).byte().cpu())
+            else:
+                pil = self.to_pil(xi.cpu())
+            xs.append(self.prep(pil))
+        x_proc = torch.stack(xs, dim=0).to(self.device)  # [B,3,256,256]
+        return x_proc
+
+
 
 class PatchSSIMLoss(torch.nn.Module):
     def __init__(self, patch_size=32, eps=1e-6):
@@ -153,7 +247,7 @@ class TotalVariationLoss(nn.Module):
         return tv_loss
     
 class PerceptualLoss(nn.Module):
-    def __init__(self, model_name="resnet18", layers=("layer2", "layer3"), device='cuda'):
+    def __init__(self, model_name="resnet18", layers=("layer3",), device='cuda'):
         """
         Perceptual Loss using intermediate features of a Timm pre-trained model.
         Args:
@@ -164,14 +258,24 @@ class PerceptualLoss(nn.Module):
         self.layers = layers
         self.device = device
 
+        # replace your create_model call with:
+        def _to_idx(tag):
+            if isinstance(tag, int):
+                return tag
+            if isinstance(tag, str) and tag.startswith("layer"):
+                return int(tag.replace("layer", ""))
+            raise ValueError(f"Unsupported layer spec: {tag}")
+
+        self.indices = tuple(_to_idx(x) for x in layers)  # e.g., ("layer3",) -> (3,)
         # Load a pre-trained model from Timm
-        self.feature_extractor = create_model(model_name, pretrained=True, features_only=True, out_indices=tuple(range(len(layers))))
+        self.feature_extractor = create_model(model_name, pretrained=True, features_only=True, out_indices=self.indices)
         self.layer_names = [f"layer{i}" for i in range(len(self.feature_extractor.feature_info))]
 
         # Freeze the feature extractor's parameters
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
-        self.feature_extractor.to(self.device)
+        self.feature_extractor.eval().to(self.device)
+        self.feature_extractor.float()
 
     def forward(self, input_image, target_image):
         """
@@ -182,6 +286,8 @@ class PerceptualLoss(nn.Module):
         Returns:
             loss: Scalar perceptual loss.
         """
+        input_image = input_image.to(dtype=torch.float32)
+        target_image = target_image.to(dtype=torch.float32)
         # Convert grayscale (1-channel) images to 3-channel by repeating
         input_image = input_image.repeat(1, 3, 1, 1)  # Shape: (B, 3, H, W)
         target_image = target_image.repeat(1, 3, 1, 1)  # Shape: (B, 3, H, W)
@@ -197,14 +303,17 @@ class PerceptualLoss(nn.Module):
         # Extract intermediate features
         input_features = self.feature_extractor(input_image)
         target_features = self.feature_extractor(target_image)
+       
+        feat_shape = input_features[0]
+        print(feat_shape.shape)
 
         # Calculate perceptual loss using L2 norm of feature differences
-        loss = 0.0
-        for input_feat, target_feat in zip(input_features, target_features):
-            loss += torch.linalg.norm(input_feat - target_feat)
+        #loss = 0.0
+        #for input_feat, target_feat in zip(input_features, target_features):
+        #    loss += torch.mean((input_feat - target_feat) ** 2) #loss += torch.linalg.norm(input_feat - target_feat)
+        diff = target_features[0] - input_features[0]
 
-        return loss
-
+        return diff, feat_shape
 
 def register_conditioning_method(name: str):
     def wrapper(cls):
@@ -230,6 +339,12 @@ class ConditioningMethod(ABC):
         self.edge_ls = CannyEdgeLoss(low_threshold=0.05, high_threshold=0.1)
         self.cnt = 0
         self.apply_mask = True
+
+        self.feat_extractor = SAMMed2DFeatExtractor(
+            model_type="vit_b",
+            image_size=256,
+            sam_checkpoint="/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth",
+            encoder_adapter=True)
 
     def edge_loss(self, image1, image2):
         """
@@ -274,34 +389,112 @@ class ConditioningMethod(ABC):
 
     def project(self, data, noisy_measurement, **kwargs):
         return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
+
+    def downsample_mask(self, mask, size):
+        """
+        mask: [B,1,H,W] (binary 0/1)
+        size: (Hf, Wf) target feature map size
+        returns: [B,1,Hf,Wf] (binary 0/1)
+        """
+        mask_ds = F.interpolate(mask.float(), size=size, mode="nearest")
+        return mask_ds
+
+    def mask_to_token_binary(self, mask, feat_hw):
+        Hf, Wf = feat_hw
+        B, _, H, W = mask.shape
+        kH = (H + Hf - 1) // Hf  # ceil kernel size if not divisible
+        kW = (W + Wf - 1) // Wf
+        binmask = F.max_pool2d(mask.float(), kernel_size=(kH,kW), stride=(H//Hf, W//Wf), padding=0)
+        # Fallback to adaptive if shapes are awkward:
+        binmask = (F.adaptive_max_pool2d(mask.float(), (Hf, Wf)) > 0).float()
+        return binmask
     
-    def grad_and_value(self, x_prev, x_0_hat, measurement, t, **kwargs):
+    def grad_and_value(self, x_prev, x_0_hat, measurement, t, hallu_mask, extrinsic, hallu_weight, **kwargs):
         if self.noiser.__name__ == 'gaussian':
 
-            x_0_hat = x_0_hat.clamp(min=0., max=1.)  ############# Ensure x_0_hat is clamped safely
+            x_0_hat = x_0_hat.clamp(min=0., max=2.)  ############# Ensure x_0_hat is clamped safely
+            tv_loss = self.tv(x_0_hat)
             # Augment measurement to generate intrinsic hallucination
-            
-            idx_lst = [100, 116, 20, 36] #[55,105,115,165]
-            hallu_mask = torch.ones_like(measurement).to(device)
-            hallu_mask[0,0,idx_lst[0]: idx_lst[1], idx_lst[2]:idx_lst[3]] = 0.0
 
-            pred_measurement = self.operator.forward(x_0_hat, **kwargs)
-            #Downsample the pred_measurement
-             
-            #measurement = self.noiser(measurement)
+            pred_measurement = self.operator.forward(x_0_hat, **kwargs)             
                 
             difference = measurement - pred_measurement
+            
+            # #Soft thresholding with 0.1
+            nohallu_mask = 1.0 - hallu_mask
+            difference_nohallu = nohallu_mask * difference
+            difference_hallu = hallu_mask * difference
+            
             norm = torch.linalg.norm(difference)
-            #Hallucination loss
-            #norm_hallu = torch.linalg.norm(difference_hallu)
-            #norm_hallu = -1.0 * norm_hallu
-            #edge_ls = self.edge_ls(measurement, pred_measurement)
-            #ssim = self.ssim(pred_measurement.type(torch.DoubleTensor), measurement.type(torch.DoubleTensor))
-            # pred_measurement[pred_measurement < 0.] = 0.
-            # measurement[measurement < 0.] = 0.
-            #percept = self.perceptual_loss(pred_measurement.type(torch.float32), measurement.type(torch.float32))
-            norm_total = norm #+ 0.5*edge_ls #+ 0.5*ssim #+ 0.005*tv
-            norm_grad = torch.autograd.grad(outputs=norm_total, inputs=x_prev)[0]
+            norm_hallu = torch.linalg.norm(difference_hallu)
+            norm_nohallu = torch.linalg.norm(difference_nohallu)
+
+            # Extrinsic loss
+            if extrinsic is not None:
+                extrinsic_difference = extrinsic - x_0_hat
+                extrinsic_difference_hallu = hallu_mask * extrinsic_difference
+                extrinsic_loss = torch.linalg.norm(extrinsic_difference_hallu)
+
+                # Feature loss
+                # ----- semantic (feature) loss over masked region -----
+                #coords = torch.nonzero(hallu_mask[0,0], as_tuple=False)  # [N,2], each row is (y,x)
+                #ymin, xmin = coords.min(dim=0).values
+                #ymax, xmax = coords.max(dim=0).values
+
+                #x_0_hat_mask = x_0_hat[:, :, ymin:ymax+1, xmin:xmax+1]     # keep it as an op on x_0_hat (no requires_grad_ here)
+                #gt_mask     = extrinsic[:, :, ymin:ymax+1, xmin:xmax+1]
+
+                # --- Tensor-only preprocessing to keep graph ---
+                # (1) resize to 256x256
+                x_cat = torch.cat((x_0_hat, extrinsic), dim=0)             # [2B,1,H,W] or [2,1,H,W]
+                x_res = torch.nn.functional.interpolate(x_cat, size=(256, 256), mode='bilinear', align_corners=False)
+
+                # (2) to 3-channel
+                x_rgb = x_res.repeat(1, 3, 1, 1)                              # [2B,3,256,256]
+
+                # (3) (optional) SAM-style pixel-space normalization if your encoder expects it
+                # mean/std in pixel space; if your inputs are 0..1, scale to 0..255 first.
+                # Uncomment if needed and ensure consistency with your encoder init.
+                x_pix = x_rgb * 255.0
+                mean = torch.tensor([123.675, 116.28, 103.53], device=x_rgb.device).view(1,3,1,1)
+                std  = torch.tensor([58.395, 57.12, 57.375], device=x_rgb.device).view(1,3,1,1)
+                x_norm = (x_pix - mean) / std
+                feats  = self.feat_extractor(x_norm.to(dtype=torch.float32))
+
+                #feats, feat_shape = self.perceptual_loss(x_0_hat, extrinsic)
+                feat_pred, feat_gt = torch.chunk(feats, 2, dim=0)
+ 
+                # 3) Downsample the mask to feature resolution (don’t hardcode 16x16)
+                Hf, Wf = feat_pred.shape[-2], feat_pred.shape[-1]
+                mask_ds = self.mask_to_token_binary(hallu_mask.float(), feat_hw=(Hf, Wf)) #torch.nn.functional.interpolate(hallu_mask.float(),size=(Hf, Wf),mode='nearest')             # [B,1,Hf,Wf]
+                assert len(torch.unique(mask_ds)) == 2, f"mask only has {torch.unique(mask_ds)}"
+                #feat_pred = feat_pred * mask_ds
+                #feat_gt = feat_gt * mask_ds
+                #feat_diff = feat_pred - feat_gt
+                feats = feat_pred - feat_gt
+                semantic_loss = feats * mask_ds #torch.linalg.norm(feat_diff)
+                semantic_loss = torch.linalg.norm(feats) #torch.mean((semantic_loss)**2)
+
+            if (extrinsic is not None) and self.apply_mask: # Extrinsic hallucination
+                self.retain_graph=True
+                norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                self.retain_graph=False
+                extrinsic_grad = torch.autograd.grad(outputs=extrinsic_loss, inputs=x_0_hat, retain_graph=self.retain_graph)[0]
+                self.retain_graph=False
+                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                norm_grad_hallu = None
+            elif (extrinsic is None) and self.apply_mask: # Intrinsic hallucination
+                self.retain_graph=True
+                norm_grad = torch.autograd.grad(outputs=norm_nohallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                norm_grad_hallu = torch.autograd.grad(outputs=norm_hallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                self.retain_graph=False
+                semantic_grad = None #torch.autograd.grad(outputs=tv_loss, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                extrinsic_grad = None
+            else:   # No hallucination
+                norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
+                semantic_grad = None
+                norm_grad_hallu = None
+                extrinsic_grad = None
         
         elif self.noiser.__name__ == 'poisson':
             Ax = self.operator.forward(x_0_hat, **kwargs)
@@ -312,8 +505,9 @@ class ConditioningMethod(ABC):
 
         else:
             raise NotImplementedError
-             
-        return norm_grad, norm
+        
+        return [norm_grad, semantic_grad, norm_grad_hallu, extrinsic_grad], [norm_nohallu, norm_hallu, pred_measurement]
+
    
     @abstractmethod
     def conditioning(self, x_t, measurement, noisy_measurement=None, **kwargs):
@@ -359,7 +553,7 @@ class PosteriorSampling(ConditioningMethod):
         self.alpha = self.scale_original
         self.best_ls = 1000
         self.loss_df = pd.DataFrame(columns=['Time', 'Loss'])
-        
+        self.cnt = 0
         self.csv_file = "./line_search_stepsize.csv"
         with open(self.csv_file, "w", newline="") as f:
             writer = csv.writer(f)
@@ -391,7 +585,7 @@ class PosteriorSampling(ConditioningMethod):
             # Ensure x_prev tracks gradients
             #x_prev = x_prev.clone().detach().requires_grad_()  #############
             
-            norm_grad_new, norm_new = self.grad_and_value(x_prev=x_t_new, x_0_hat=x_0_hat_new, measurement=measurement, t=t, **kwargs)
+            norm_grad_new, norm_grad_hallu_new, norm_new = self.grad_and_value(x_prev=x_t_new, x_0_hat=x_0_hat_new, measurement=measurement, t=t, **kwargs)
            # assert len(torch.unique(norm_grad_new.cpu().detach())) > 1, f"Norm grad is zero: {torch.unique(norm_grad_new.cpu().detach())}"
 
             # Check Wolfe conditions
@@ -427,57 +621,89 @@ class PosteriorSampling(ConditioningMethod):
         # If no suitable step size is found, return the minimum step size
         return self.alpha #alpha_min
     
-    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, patch_idx, **kwargs):
-    # Compute initial gradient and norm
-        #x_prev.requires_grad_()  ###############
-        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, **kwargs)
-        #Add t and norm to dataframe
-        self.loss_df = self.loss_df.append({'Time': t.cpu().numpy()[0], 'Loss': norm.detach().cpu().numpy()}, ignore_index=True)
-        #print(f"Loss at {t.cpu().detach().numpy()}: {norm}")
-        if self.best_ls > norm:
-            self.best_ls = norm
-            self.best_x = x_0_hat
-
-        self.alpha = self.scale_original
-        # Perform line search to find step size satisfying Wolfe conditions
-        if (kwargs['line_search']) and (t>0):
-            self.scale = self.line_search(x_prev.detach(), x_t.detach().requires_grad_(True), x_0_hat, measurement, norm_grad.detach(), norm, t, **kwargs)
-            # print(f"Line Search Activated! Step size for iteration {t}: {self.scale}")
-            # Save to CSV
-            #with open(self.csv_file, 'a', newline='') as file:
-            #    writer = csv.writer(file)
-            #    writer.writerow([t, self.scale])
-        else:
-            pass
-            #self.scale = self.scale_original
-            #if kwargs['line_search']:
-            #    with open(self.csv_file, 'a', newline='') as file:
-            #        writer = csv.writer(file)
-            #        writer.writerow([t, self.scale])
-            #    print(f"Step size for final iteration {t}: {self.scale}")
-
-        #idx_lst = [100,108,20,28] #[55,105,115,165]
-        idx_lst = patch_idx
-        hallu_mask = torch.ones_like(measurement).to(device)
+    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, patch_idx, extrinsic, **kwargs):
         
-        #there are multiple patches, so we need to loop through them
-        for i in range(len(idx_lst)):
-            #print("idx_lst: ", idx_lst[i][0].start, idx_lst[i][0].stop, idx_lst[i][1].start, idx_lst[i][1].stop)
-            hallu_mask[0,0,idx_lst[i][0], idx_lst[i][1]] = -0.05 #-0.1
-        #hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
-        if self.apply_mask:
-            norm_grad = norm_grad * hallu_mask
+        self.idx_lst = patch_idx
+        self.mu = 0.1
+        self.hallu_weight = 0.001 #0.08 #05 #0.06 #0.01 # if self.mu < 1 else self.sclale * self.mu * 1.
+        self.semantic_weight = 0.1
+        self.tv_coeff = 5e-5
+        if t == 999:
+            self.v_momentum = 0                      # velocity image, same shape as x
+            self.beta_momentum = 0.9                 # momentum factor
 
-        x_t -= norm_grad * self.scale
+        #if (self.apply_mask is True):
+        #    assert self.hallu_weight >= self.scale * self.mu, f"Hallu Step {self.hallu_weight} must be bigger than {self.scale * self.mu}"
 
+        self.hallu_mask = torch.zeros_like(measurement).to(device)
+        for i in range(len(self.idx_lst)):
+            self.hallu_mask[0,0,self.idx_lst[i][0], self.idx_lst[i][1]] = 1.0
+        
+        # Compute initial gradient and norm
+        #x_prev.requires_grad_()  ###############
+        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, hallu_mask = self.hallu_mask, extrinsic=extrinsic, hallu_weight=self.hallu_weight, **kwargs)
+
+        if (self.apply_mask == True):
+            norm_grad, semantic_grad, norm_grad_hallu, extrinsic_grad = norm_grad[0], norm_grad[1], norm_grad[2], norm_grad[3]
+            norm_nohallu, norm_hallu, pred_measurement = norm[0], norm[1], norm[2]
+        else:
+            norm_grad = norm_grad[0]
+            norm_nohallu = norm_grad.clone()
+            norm_hallu = norm_grad.clone()
+        #Add t and norm to dataframe
+        self.loss_df = self.loss_df.append({'Time': t.cpu().numpy()[0], 'NoHalluLoss': norm_nohallu.detach().cpu().numpy(), 'HalluLoss': norm_hallu.detach().cpu().numpy()}, ignore_index=True)
+        extrinsic_flag = True if extrinsic is not None else False
+        self.loss_df.to_csv(f'measurement_loss_timestep_extrinsic_{extrinsic_flag}.csv')
+        
+        # #there are multiple patches, so we need to loop through them
+        # self.hallu_weight = -0.1
+        # for i in range(len(idx_lst)):
+        #     #print("idx_lst: ", idx_lst[i][0].start, idx_lst[i][0].stop, idx_lst[i][1].start, idx_lst[i][1].stop)
+        #     hallu_mask[0,0,idx_lst[i][0], idx_lst[i][1]] = self.hallu_weight #-0.1
+        # #hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
+
+        if (self.apply_mask) and (extrinsic is None):# and (t <= 800): #Intrinsic hallucination
+            if t <= 10:
+                self.hallu_weight = 0.0
+                self.mu = 0.0
+                self.tv_grad = 0.0
+                print("APPLY MASK INVOKED!")
+
+            self.nohallu_mask = 1.0 - self.hallu_mask
+            assert len(torch.unique(self.nohallu_mask)) == 2, f"There is no hallucination mask unique: {torch.unique(self.nohallu_mask,return_counts=True)}"
+            # #Soft thresholding with 0.1
+            #self.nohallu_mask = torch.where(self.nohallu_mask == 0.0, self.mu, self.nohallu_mask)
+            #norm_grad_hallu = norm_grad / (norm_grad.norm() + 1e-12)       # unit-norm to control scale
+            #self.v_momentum = self.beta_momentum * self.v_momentum + (1 - self.beta_momentum) * norm_grad_hallu    # momentum update
+            x_t = x_t - norm_grad * self.scale * self.nohallu_mask + norm_grad_hallu * self.hallu_weight * self.hallu_mask
+        elif (extrinsic is not None) and (self.apply_mask): #Extrinsic hallucination
+            if t <= 10:
+                self.hallu_weight = 0.0
+                self.semantic_weight = 0.0
+                
+           
+            #    self.mu = 0.0
+            #    self.tv_grad = 0.0
+            #    print("APPLY MASK INVOKED!")
+            self.nohallu_mask = 1.0 - self.hallu_mask
+            if t<=10:
+                # Apply soft thresholding to reduce step size in hallucination regions
+                self.nohallu_mask[self.nohallu_mask == 0.0] = 0.1   
+         
+            assert len(torch.unique(self.nohallu_mask)) == 2, f"There is no hallucination mask unique: {torch.unique(self.nohallu_mask,return_counts=True)}"
+            #norm_grad_hallu = norm_grad / (norm_grad.norm() + 1e-12)       # unit-norm to control scale
+            #self.v_momentum = self.beta_momentum * self.v_momentum + (1 - self.beta_momentum) * norm_grad_hallu    # momentum update
+            if t <= 10:
+                x_t = x_t - norm_grad * self.scale + semantic_grad * self.semantic_weight * self.hallu_mask +extrinsic_grad * self.hallu_weight * self.hallu_mask 
+            else:
+                x_t = x_t - norm_grad * self.scale * self.nohallu_mask
+        else:
+            x_t -= norm_grad * self.scale
+        #if t == 0:
+            #np.save(f"pred_measurement_{self.cnt}.npy", pred_measurement.detach().cpu().numpy())
+         #   self.cnt += 1
         #if t > 0:
         return x_t, norm
-        #print("Returning best loss: ", self.best_ls)
-        #print("Re-initializing best loss")
-        #self.best_ls = 1000
-        #save dataframe
-        #self.loss_df.to_csv('measurement_loss_timestep_memorybank.csv')
-        #return self.best_x, self.best_ls
         
 @register_conditioning_method(name='ps+')
 class PosteriorSamplingPlus(ConditioningMethod):

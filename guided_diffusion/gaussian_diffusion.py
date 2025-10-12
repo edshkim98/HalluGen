@@ -133,7 +133,7 @@ class GaussianDiffusion:
             self.max_val = 1.0
             self.min_val = 0.0
         else:
-            self.max_val = 1.0
+            self.max_val = 2.0
             self.min_val = 0.0
         
         self.model_mean_type = model_mean_type
@@ -197,7 +197,41 @@ class GaussianDiffusion:
         )
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t, noise=None):
+    def generate_frequency_weight(self, shape, f_cutoff=0.2):
+        """
+        shape: (H, W), f_cutoff ∈ (0, ~0.7)
+        Returns: (H, W) high-pass weight mask
+        """
+        H, W = shape
+        u = th.fft.fftfreq(H).unsqueeze(1)  # (H, 1)
+        v = th.fft.fftfreq(W).unsqueeze(0)  # (1, W)
+        freq_magnitude = th.sqrt(u ** 2 + v ** 2)
+        weight = th.clamp((freq_magnitude / f_cutoff), 0, 1)
+        return weight  # shape (H, W)
+
+    def image_frequency(self, images, mask):
+        """
+        Applies a frequency-domain mask to a batch of images.
+    
+        images: Tensor of shape (B, C, H, W)
+        mask: Tensor of shape (H, W)
+    
+        Returns:
+            masked_images: Tensor of shape (B, C, H, W), real-valued
+        """
+        B, C, H, W = images.shape
+        assert mask.shape == (H, W), "Mask must match spatial dimensions"
+    
+        # FFT
+        images_fft = th.fft.fft2(images)  # (B, C, H, W), complex
+        # Broadcast mask: (1, 1, H, W)
+        mask = mask.to(images.device).unsqueeze(0).unsqueeze(0)
+        images_fft_masked = images_fft * mask  # Apply high-pass
+        # IFFT and return real part
+        images_ifft = th.fft.ifft2(images_fft_masked).real
+        return images_ifft  # (B, C, H, W)
+
+    def q_sample(self, x_start, t, noise=None, freq_weighted=False):
         """
         Diffuse the data for a given number of diffusion steps.
 
@@ -211,6 +245,9 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         assert noise.shape == x_start.shape
+        if freq_weighted:
+            noise_weight = self.generate_frequency_weight(x_start.shape[2:], f_cutoff=0.2)
+            noise = self.image_frequency(noise, noise_weight)
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
@@ -242,7 +279,7 @@ class GaussianDiffusion:
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(
-        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None
+        self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None, cond_img=None
     ):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
@@ -317,9 +354,12 @@ class GaussianDiffusion:
         elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:
             if self.model_mean_type == ModelMeanType.START_X:
                 pred_xstart = process_xstart(model_output)
+                
                 if self.skip_timesteps:
-                    self.weight = 1-(t/self.skip_timesteps)
-                    pred_xstart = self.weight*pred_xstart + (1-self.weight)*self.skip_x0
+                    self.weight = 1-(t/(1000 -self.skip_timesteps)) #linear decay
+                    if t == 199 or t == 1:
+                        print(f'weight: {self.weight} at t: {t}')
+                    pred_xstart = (1- self.hallu_mask) * (self.weight*pred_xstart + (1-self.weight)*self.cond_img) + self.hallu_mask * pred_xstart
             else:
                 pred_xstart = process_xstart(
                     self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
@@ -473,7 +513,9 @@ class GaussianDiffusion:
         skip_timesteps=None,
         skip_x0=None,
         line_search=False,
-        patch_idx=None
+        cond_img=None,
+        patch_idx=None,
+        extrinsic=None
     ):
         """
         Generate samples from the model.
@@ -510,7 +552,9 @@ class GaussianDiffusion:
             skip_timesteps=skip_timesteps,
             skip_x0=skip_x0,
             line_search=line_search,
-            patch_idx=patch_idx
+            cond_img=cond_img,
+            patch_idx=patch_idx,
+            extrinsic=extrinsic
         ):
             final = sample
         return final["sample"]
@@ -531,7 +575,9 @@ class GaussianDiffusion:
         skip_timesteps=False,
         skip_x0=None,
         line_search=False,
+        cond_img=None,
         patch_idx=None,
+        extrinsic=None
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -542,6 +588,7 @@ class GaussianDiffusion:
         p_sample().
         """
         self.skip_timesteps = skip_timesteps
+        self.cond_img = cond_img
         self.line_search = line_search  
         if self.skip_timesteps:
             self.skip_x0 = skip_x0.to(device)
@@ -554,7 +601,10 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        indices = list(range(self.num_timesteps))[::-1] # 1000, 999, ..., 1, 0
+            #measurement = th.clip(measurement,0.,1.)
+            #img = self.q_sample(measurement**(1/0.7), th.tensor(self.num_timesteps-1 * shape[0], device=device), freq_weighted=True)
+            print('Mean: {}, Std: {}'.format(th.mean(img), th.std(img)))
+        indices = list(range(self.num_timesteps))[::-1] # 999, ..., 1, 0
         if self.skip_timesteps:
             indices = indices[skip_timesteps:]
             img = skip_x0.to(device)
@@ -568,6 +618,10 @@ class GaussianDiffusion:
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
+
+        self.hallu_mask = th.zeros_like(img).to(device)
+        for i in range(len(patch_idx)):
+            self.hallu_mask[0,0,patch_idx[i][0], patch_idx[i][1]] = 1.0
 
         for i in indices:
             self.t = i
@@ -615,6 +669,7 @@ class GaussianDiffusion:
                                         cond_fn=cond_fn,
                                         model_kwargs=model_kwargs,
                                         patch_idx=patch_idx,
+                                        extrinsic=extrinsic,
                                         device=device)
                 else:
                     #TODO: how can we handle argument for different condition method?
@@ -625,8 +680,10 @@ class GaussianDiffusion:
                                         x_0_hat=out['pred_xstart'],
                                         t=t,
                                         line_search=self.line_search,
-                                        patch_idx=patch_idx)
+                                        patch_idx=patch_idx,
+                                        extrinsic=extrinsic)
                 img = img.detach_()
+
                 out['sample'] = img
 
                 yield out

@@ -178,7 +178,7 @@ class GaussialBlurOperator(LinearOperator):
         
         # Downsample using F.interpolate
         assert data.shape[-1] == 256, f"img must be shape 256 but got {data.shape[-1]}"
-        down_scale = 2.0 #1.43
+        down_scale = 4.0 #1.43
         img_down = Resize((int(256//down_scale), int(256//down_scale)))(data)
         #data = F.interpolate(data, scale_factor=down_scale, mode='bilinear', align_corners=False)
 
