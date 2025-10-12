@@ -1,2 +1,2 @@
-# MedHalluDiffusion
-A repository for generating hallucinated features in medical images (e.g. Brain MRI) using score-matching models.
+# HalluGen
+A repository for generating hallucinations in image restoration
