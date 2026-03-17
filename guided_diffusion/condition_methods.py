@@ -22,8 +22,11 @@ import nibabel as nib
 import sys
 from types import SimpleNamespace
 from torchvision import transforms
+import timm
+from scipy.ndimage import label
 
 sys.path.append('/SAN/medic/IQT_ScoreMatching/SAM-Med2D')
+#sys.path.append('/SAN/medic/IQT_ScoreMatching/segment-anything')
 
 from segment_anything import sam_model_registry
 
@@ -34,6 +37,172 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 np.random.seed(42)
 
+class TimmFeatExtractor(nn.Module):
+    """
+    Feature extractor using Timm pre-trained models.
+    """
+
+    def __init__(self,
+                model_name: str = "vit_base_patch16_dinov3.lvd1689m"):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_name = model_name
+        # Load a pre-trained model from Timm
+        # Initialize feature extractor using timm
+        if 'sam' in self.model_name.lower() or 'dinov2' in self.model_name.lower():
+            self.model = timm.create_model(
+                self.model_name,
+                pretrained=True,
+                num_classes=0,      # No classification head
+            ).to(device).eval()
+        elif 'resnet' in self.model_name.lower():            
+            self.model = timm.create_model(
+                self.model_name,
+                pretrained=True,
+                features_only=True,  # Return intermediate feature maps
+                out_indices=[1, 2]     # Use last layer features 1,2, 3
+            ).to(device).eval()
+        elif 'dinov3' in self.model_name.lower():            
+            self.model = timm.create_model(
+                model_name,
+                pretrained=True,
+                features_only=True,  # Return intermediate feature maps
+                out_indices=[1, 2, 3]     # Use last layer features 1,2, 3
+            ).to(device).eval()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract spatial feature maps from images.
+        
+        Args:
+            x: Input images (N, C, H, W)
+        
+        Returns:
+            features: Spatial feature maps (N, C', H', W')
+        """
+        with torch.enable_grad():  # Allow gradients
+            if 'sam' in self.model_name.lower() or 'dinov2' in self.model_name.lower():
+                N, C, H, W = x.shape
+                features = self.model.forward_features(x)  # (N, C', H', W')
+                # Check if features are tokens or spatial
+                if features.dim() == 3:  # (N, num_patches, C)
+                    N, num_patches, C = features.shape
+                    H = W = int(num_patches ** 0.5)
+                    features = features.transpose(1, 2).reshape(N, C, H, W)
+            else:
+                features = self.model(x)
+            if isinstance(features, (list, tuple)):
+                #features = features[-1]  # Take last layer
+                # Upsample and concatenate all features
+                if features[0].shape[2] != features[-1].shape[2] or features[0].shape[3] != features[-1].shape[3]:
+                    feats = []
+                else:
+                    feats = torch.zeros_like(features[-1]) 
+                for feat in features:
+                    if isinstance(feats, list):
+                        feat = F.interpolate(feat, size=(features[-1].shape[2], features[-1].shape[3]), mode='bilinear', align_corners=False)
+                        feats.append(feat)
+                    else:
+                        feats += feat
+                if isinstance(feats, list):
+                    features = torch.cat(feats, dim=1)
+                else:
+                    features = feats / len(features)
+        return features
+
+class SAMFeatExtractor(nn.Module):
+    """
+    Feature extractor using original SAM model.
+    - Uses SAM's image encoder only
+    - forward expects x: [B, 3, 1024, 1024] (SAM's native resolution)
+    - Includes preprocessing helper for resizing to 1024x1024
+    """
+    def __init__(self,
+                 model_type: str = "vit_b",
+                 image_size: int = 1024,  # SAM uses 1024x1024
+                 sam_checkpoint: str = "sam_vit_b_01ec64.pth"):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.image_size = image_size
+
+        # --- Build original SAM model ---
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam = sam.to(self.device).eval()
+        self.encoder = sam.image_encoder
+
+        # Enable gradients for training (SAM freezes encoder by default)
+        for param in self.encoder.parameters():
+            param.requires_grad = True
+
+        # Preprocessing transforms
+        self.to_pil = transforms.ToPILImage()
+        self.prep = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ])
+        
+        # SAM normalization: mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375]
+        # These are in BGR order but applied to RGB, scaled to [0,1] range
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],  # ImageNet stats (SAM uses these)
+            std=[0.229, 0.224, 0.225]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, 3, 1024, 1024] (already batched, resized & normalized)
+        Returns: feature map [B, 256, 64, 64] for vit_b
+        """
+        x = x.to(self.device)
+        fmap = self.encoder(x)
+        return fmap
+
+    def preprocess(self, x: torch.Tensor, normalize: bool = True, use_pil: bool = False) -> torch.Tensor:
+        """
+        Resize and optionally normalize for SAM.
+        x: [B, 3, H, W] in [0,1] or [0,255]
+        Returns: [B, 3, 1024, 1024] ready for SAM
+        
+        Args:
+            use_pil: If True, uses PIL (breaks gradients). If False, uses pure PyTorch (preserves gradients)
+        """
+        # Handle grayscale
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        if x.dim() != 4 or x.size(1) != 3:
+            raise ValueError("preprocess expects [B,3,H,W]")
+
+        if use_pil:
+            # PIL path - breaks gradients but sometimes needed for inference
+            xs = []
+            for i in range(x.size(0)):
+                xi = x[i]
+                if xi.dtype.is_floating_point:
+                    xi_01 = xi.clamp(0, 1)
+                    pil = self.to_pil((xi_01 * 255).byte().cpu())
+                else:
+                    pil = self.to_pil(xi.cpu())
+                xs.append(self.prep(pil))
+            x_proc = torch.stack(xs, dim=0).to(self.device)
+        else:
+            # Pure PyTorch path - preserves gradients for training
+            # Ensure input is in [0, 1] range
+            if not x.dtype.is_floating_point:
+                x = x.float() / 255.0
+            x = x.clamp(0, 1)
+            
+            # Resize using bilinear interpolation (differentiable)
+            x_proc = F.interpolate(x, size=(self.image_size, self.image_size), 
+                                  mode='bilinear', align_corners=False)
+            x_proc = x_proc.to(self.device)
+        
+        # Apply SAM normalization
+        if normalize:
+            x_proc = self.normalize(x_proc)
+        
+        return x_proc
+    
 class SAMMed2DFeatExtractor(nn.Module):
     """
     Single-class version of your original code.
@@ -86,33 +255,51 @@ class SAMMed2DFeatExtractor(nn.Module):
             fmap = out
         return fmap
 
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+    def preprocess(self, x: torch.Tensor, normalize: bool = False, use_pil: bool = False) -> torch.Tensor:
         """
-        Optional helper if you still want the old PIL path.
-        Accepts x: [B, 3, H, W] in [0,1] or [0,255]; returns [B, 3, 256, 256] in [0,1].
-        Note: SAM-Med2D typically expects further normalization upstream if required.
+        Resize and optionally normalize for SAM.
+        x: [B, 3, H, W] in [0,1] or [0,255]
+        Returns: [B, 3, 1024, 1024] ready for SAM
+        
+        Args:
+            use_pil: If True, uses PIL (breaks gradients). If False, uses pure PyTorch (preserves gradients)
         """
-
+        # Handle grayscale
         if x.size(1) == 1:
-            x = x.repeat(1, 3, 1, 1)  # Convert grayscale to 3-channel by repeating
+            x = x.repeat(1, 3, 1, 1)
 
         if x.dim() != 4 or x.size(1) != 3:
             raise ValueError("preprocess expects [B,3,H,W]")
 
-        # Convert each sample via PIL -> resize -> ToTensor (kept simple like your original)
-        xs = []
-        for i in range(x.size(0)):
-            xi = x[i]
-            # Ensure uint8 for PIL if input is float
-            if xi.dtype.is_floating_point:
-                xi_01 = xi.clamp(0, 1)
-                pil = self.to_pil((xi_01 * 255).byte().cpu())
-            else:
-                pil = self.to_pil(xi.cpu())
-            xs.append(self.prep(pil))
-        x_proc = torch.stack(xs, dim=0).to(self.device)  # [B,3,256,256]
+        if use_pil:
+            # PIL path - breaks gradients but sometimes needed for inference
+            xs = []
+            for i in range(x.size(0)):
+                xi = x[i]
+                if xi.dtype.is_floating_point:
+                    xi_01 = xi.clamp(0, 1)
+                    pil = self.to_pil((xi_01 * 255).byte().cpu())
+                else:
+                    pil = self.to_pil(xi.cpu())
+                xs.append(self.prep(pil))
+            x_proc = torch.stack(xs, dim=0).to(self.device)
+        else:
+            # Pure PyTorch path - preserves gradients for training
+            # Ensure input is in [0, 1] range
+            if not x.dtype.is_floating_point:
+                x = x.float() / 255.0
+            x = x.clamp(0, 1)
+            
+            # Resize using bilinear interpolation (differentiable)
+            x_proc = F.interpolate(x, size=(self.image_size, self.image_size), 
+                                  mode='bilinear', align_corners=False)
+            x_proc = x_proc.to(self.device)
+        
+        # Apply SAM normalization
+        #if normalize:
+        #    x_proc = self.normalize(x_proc)
+        
         return x_proc
-
 
 
 class PatchSSIMLoss(torch.nn.Module):
@@ -339,11 +526,27 @@ class ConditioningMethod(ABC):
         self.edge_ls = CannyEdgeLoss(low_threshold=0.05, high_threshold=0.1)
         self.cnt = 0
         self.apply_mask = True
+        self.hvm_flag = False
+        if self.apply_mask == False:
+            self.hvm_flag = True
+        self.checkpoint = "/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth" #"/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth" 
+#"/SAN/medic/IQT_ScoreMatching/segment-anything/sam_vit_b_01ec64.pth" #"/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth" 
+        self.imagenet_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(device)
+        self.imagenet_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(device)
+
+        #self.feat_extractor = TimmFeatExtractor(
+        #    model_name=self.checkpoint
+        #)
+
+        #self.feat_extractor = SAMFeatExtractor(
+        #    model_type="vit_b",
+        #    image_size=1024,
+        #    sam_checkpoint=self.checkpoint)
 
         self.feat_extractor = SAMMed2DFeatExtractor(
             model_type="vit_b",
             image_size=256,
-            sam_checkpoint="/SAN/medic/IQT_ScoreMatching/SAM-Med2D/sam-med2d_b.pth",
+            sam_checkpoint=self.checkpoint,
             encoder_adapter=True)
 
     def edge_loss(self, image1, image2):
@@ -409,86 +612,198 @@ class ConditioningMethod(ABC):
         binmask = (F.adaptive_max_pool2d(mask.float(), (Hf, Wf)) > 0).float()
         return binmask
     
-    def grad_and_value(self, x_prev, x_0_hat, measurement, t, hallu_mask, extrinsic, hallu_weight, **kwargs):
+    def standardized_effect_size(self, hallu_vals, clean_vals):
+        """Compute effect size after z-scoring"""
+        # Pool all data to get normalization parameters
+        all_vals = np.concatenate([hallu_vals, clean_vals])
+        # Calculate mean and std excluding background if needed
+        mean_all = np.mean(all_vals)
+        std_all = np.std(all_vals)
+        
+        # Z-score normalize
+        hallu_z = (hallu_vals - mean_all) / std_all
+        clean_z = (clean_vals - mean_all) / std_all
+        
+        # Now compute Cohen's d on normalized data
+        pooled_std = np.sqrt((np.var(hallu_z) + np.var(clean_z)) / 2)
+        d = (np.mean(hallu_z) - np.mean(clean_z)) / pooled_std
+        
+        return np.abs(d)
+    
+    def hallucination_verification_legacy(self, pred,  pred_measurement, measurement, gt, hallu_mask, extrinsic, **kwargs):
+        # Compute metrics to verify hallucination quality: For intrinsic we compute effect size on measurement consistency and for extrinsic we compute image-space metrics
+
+        # Extract hallucinated regions from predicted measurement and ground truth
+        pred_measurement_hallu = pred_measurement[hallu_mask == 1]
+        measurement_hallu = measurement[hallu_mask == 1]
+
+        if extrinsic is None:
+            # Intrinsic hallucination verification
+            effect = self.standardized_effect_size(pred_measurement_hallu.detach().cpu().numpy(), measurement_hallu.detach().cpu().numpy())
+            qualified = effect > 0.1 # Threshold for significant effect size
+        else:
+            # Extrinsic hallucination verification
+            gt_hallu = gt[hallu_mask == 1]
+            pred_hallu = pred[hallu_mask == 1]
+            effect_measurement = self.standardized_effect_size(pred_measurement_hallu.detach().cpu().numpy(), measurement_hallu.detach().cpu().numpy())
+            effect_image = self.standardized_effect_size(pred_hallu.detach().cpu().numpy(), gt_hallu.detach().cpu().numpy())
+            qualified = (effect_measurement < 0.1) and (effect_image > 0.05) # Measurement should be consistent while image should have significant change
+            if qualified == False:
+                print(f"HVM pass failed, measurement: {effect_measurement} image: {effect_image}")
+            else:
+                print(f"HVM passed, measurement: {effect_measurement} image: {effect_image}")
+
+        return qualified
+
+    def hallucination_verification(self, pred, pred_measurement, measurement, gt, hallu_mask, extrinsic, **kwargs):
+        # Identify individual boxes in the mask
+        # label() assigns a unique integer (1, 2, 3...) to each non-overlapping box
+        labeled_mask, num_features = label(hallu_mask.detach().cpu().numpy())
+    
+        if num_features == 0:
+            return False
+
+        # Iterate through each individual box
+        for i in range(1, num_features + 1):
+            # Create a mask specifically for the current box
+            current_box_mask = (labeled_mask == i)
+        
+            # Extract regions for the specific box
+            pm_box = pred_measurement.detach().cpu().numpy()[current_box_mask]
+            m_box = measurement.detach().cpu().numpy()[current_box_mask]
+        
+            if extrinsic is None:
+                # Intrinsic verification per box
+                effect = self.standardized_effect_size(pm_box, m_box)
+                if not (effect > 0.1):
+                    print(f"Box {i} failed Intrinsic HVM: effect {effect:.4f}")
+                    return False
+            else:
+                # Extrinsic verification per box
+                gt_box = gt.detach().cpu().numpy()[current_box_mask]
+                p_box = pred.detach().cpu().numpy()[current_box_mask]
+            
+                eff_m = self.standardized_effect_size(pm_box, m_box)
+                eff_i = self.standardized_effect_size(p_box, gt_box)
+            
+                # Condition: Measurement consistency AND significant image-space change
+                qualified_box = (eff_m < 0.1) and (eff_i > 0.05)
+            
+                if not qualified_box:
+                    print(f"Box {i} failed Extrinsic HVM, meas: {eff_m:.4f} img: {eff_i:.4f}")
+                    return False
+                else:
+                    print(f"Box {i} passed, meas: {eff_m:.4f} img: {eff_i:.4f}")
+
+        # If the loop completes without returning False, all boxes passed
+        return True
+
+    def grad_and_value(self, x_prev, x_0_hat, measurement, t, hallu_mask, extrinsic, semantic, hallu_weight, **kwargs):
         if self.noiser.__name__ == 'gaussian':
 
             x_0_hat = x_0_hat.clamp(min=0., max=2.)  ############# Ensure x_0_hat is clamped safely
-            tv_loss = self.tv(x_0_hat)
+            #tv_loss = self.tv(x_0_hat)
             # Augment measurement to generate intrinsic hallucination
 
-            pred_measurement = self.operator.forward(x_0_hat, **kwargs)             
+            pred_measurement = self.operator.forward(x_0_hat, **kwargs)          
+
+            if t == 0 and self.apply_mask == True:
+                self.hvm_flag = self.hallucination_verification(pred=x_0_hat, pred_measurement=pred_measurement, measurement=measurement, gt=extrinsic, hallu_mask=hallu_mask, extrinsic=extrinsic, **kwargs)
+                print(f"Step {self.cnt}: Hallucination verification passed?: {self.hvm_flag}")                   
                 
             difference = measurement - pred_measurement
-            
-            # #Soft thresholding with 0.1
-            nohallu_mask = 1.0 - hallu_mask
-            difference_nohallu = nohallu_mask * difference
-            difference_hallu = hallu_mask * difference
-            
+            # 2. Calculate the norm PER SAMPLE (dim=1, 2, 3)
+            # Reshape to [B, -1] makes it easy to take the norm across all non-batch dims
+            #norm = torch.linalg.norm(difference.view(difference.shape[0], -1), dim=1)
             norm = torch.linalg.norm(difference)
-            norm_hallu = torch.linalg.norm(difference_hallu)
-            norm_nohallu = torch.linalg.norm(difference_nohallu)
 
-            # Extrinsic loss
+            if self.apply_mask == True: 
+                # #Soft thresholding with 0.1
+                nohallu_mask = 1.0 - hallu_mask
+                difference_nohallu = nohallu_mask * difference
+                difference_hallu = hallu_mask * difference
+
+                norm_hallu = torch.linalg.norm(difference_hallu)
+                norm_nohallu = torch.linalg.norm(difference_nohallu)           
+            else:
+                norm_hallu = norm.clone()
+                norm_nohallu = norm.clone()            
+
             if extrinsic is not None:
                 extrinsic_difference = extrinsic - x_0_hat
                 extrinsic_difference_hallu = hallu_mask * extrinsic_difference
                 extrinsic_loss = torch.linalg.norm(extrinsic_difference_hallu)
-
+            # Extrinsic loss
+            if semantic is not None:
                 # Feature loss
-                # ----- semantic (feature) loss over masked region -----
-                #coords = torch.nonzero(hallu_mask[0,0], as_tuple=False)  # [N,2], each row is (y,x)
-                #ymin, xmin = coords.min(dim=0).values
-                #ymax, xmax = coords.max(dim=0).values
-
-                #x_0_hat_mask = x_0_hat[:, :, ymin:ymax+1, xmin:xmax+1]     # keep it as an op on x_0_hat (no requires_grad_ here)
-                #gt_mask     = extrinsic[:, :, ymin:ymax+1, xmin:xmax+1]
 
                 # --- Tensor-only preprocessing to keep graph ---
                 # (1) resize to 256x256
-                x_cat = torch.cat((x_0_hat, extrinsic), dim=0)             # [2B,1,H,W] or [2,1,H,W]
+                x_cat = torch.cat((x_0_hat, semantic), dim=0)             # [2B,1,H,W] or [2,1,H,W]
                 x_res = torch.nn.functional.interpolate(x_cat, size=(256, 256), mode='bilinear', align_corners=False)
 
-                # (2) to 3-channel
-                x_rgb = x_res.repeat(1, 3, 1, 1)                              # [2B,3,256,256]
+                if x_res.shape[1] == 1:
+                    # (2) to 3-channel
+                    x_rgb = x_res.repeat(1, 3, 1, 1)                              # [2B,3,256,256]
+                else:
+                    x_rgb = x_res
 
                 # (3) (optional) SAM-style pixel-space normalization if your encoder expects it
                 # mean/std in pixel space; if your inputs are 0..1, scale to 0..255 first.
                 # Uncomment if needed and ensure consistency with your encoder init.
-                x_pix = x_rgb * 255.0
-                mean = torch.tensor([123.675, 116.28, 103.53], device=x_rgb.device).view(1,3,1,1)
-                std  = torch.tensor([58.395, 57.12, 57.375], device=x_rgb.device).view(1,3,1,1)
-                x_norm = (x_pix - mean) / std
-                feats  = self.feat_extractor(x_norm.to(dtype=torch.float32))
+                if x_rgb.max() > 1.0:
+                    x_rgb /= 2.0
 
-                #feats, feat_shape = self.perceptual_loss(x_0_hat, extrinsic)
+                # (4) extract features
+                if 'dinov3' in self.checkpoint:
+                    x_rgb = F.interpolate(x_rgb, size=(224, 224), mode='bilinear', align_corners=False)  # [2B,3,224,224]
+                    x_norm = (x_rgb - self.imagenet_mean) / self.imagenet_std  # [2B,3,256,256]
+                elif 'med2d' in self.checkpoint:
+                    x_norm = x_rgb
+                elif 'sam' in self.checkpoint:
+                    x_norm = self.feat_extractor.preprocess(x_rgb, normalize=True)  # [2B,3,1024,1024]
+                else:
+                    # Raise error if unknown checkpoint
+                    raise ValueError(f"Unknown checkpoint type: {self.checkpoint}")
+                    
+                feats  = self.feat_extractor(x_norm.to(dtype=torch.float32))
+                assert feats != None, f"feats is None: {feats}"
+
                 feat_pred, feat_gt = torch.chunk(feats, 2, dim=0)
  
                 # 3) Downsample the mask to feature resolution (don’t hardcode 16x16)
                 Hf, Wf = feat_pred.shape[-2], feat_pred.shape[-1]
-                mask_ds = self.mask_to_token_binary(hallu_mask.float(), feat_hw=(Hf, Wf)) #torch.nn.functional.interpolate(hallu_mask.float(),size=(Hf, Wf),mode='nearest')             # [B,1,Hf,Wf]
-                assert len(torch.unique(mask_ds)) == 2, f"mask only has {torch.unique(mask_ds)}"
+                H, W = x_0_hat.shape[-2], x_0_hat.shape[-1]
+                feat_pred = F.interpolate(feat_pred, size=(H, W), mode='bilinear', align_corners=False)
+                feat_gt = F.interpolate(feat_gt, size=(H, W), mode='bilinear', align_corners=False)
+                #mask_ds = self.mask_to_token_binary(hallu_mask.float(), feat_hw=(Hf, Wf)) #torch.nn.functional.interpolate(hallu_mask.float(),size=(Hf, Wf),mode='nearest')             # [B,1,Hf,Wf]
+               
+                if hallu_mask.shape[1] == 3:
+                    hallu_mask = hallu_mask[:,[0]]
+                #assert feats.shape[1] != 2, f"mask only has {torch.unique(mask_ds)}"
                 #feat_pred = feat_pred * mask_ds
                 #feat_gt = feat_gt * mask_ds
-                #feat_diff = feat_pred - feat_gt
+                #feats = feat_pred - feat_gt
                 feats = feat_pred - feat_gt
-                semantic_loss = feats * mask_ds #torch.linalg.norm(feat_diff)
+                semantic_loss = feats * hallu_mask #torch.linalg.norm(feat_diff)
                 semantic_loss = torch.linalg.norm(feats) #torch.mean((semantic_loss)**2)
-
+                assert semantic_loss > 0, f"Loss is zero: {torch.unique(mask_ds)}, {semantic_loss}"
+            
             if (extrinsic is not None) and self.apply_mask: # Extrinsic hallucination
                 self.retain_graph=True
                 norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, retain_graph=self.retain_graph)[0]
                 self.retain_graph=False
                 extrinsic_grad = torch.autograd.grad(outputs=extrinsic_loss, inputs=x_0_hat, retain_graph=self.retain_graph)[0]
                 self.retain_graph=False
-                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0] if semantic is not None else None
                 norm_grad_hallu = None
+            
             elif (extrinsic is None) and self.apply_mask: # Intrinsic hallucination
                 self.retain_graph=True
                 norm_grad = torch.autograd.grad(outputs=norm_nohallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
                 norm_grad_hallu = torch.autograd.grad(outputs=norm_hallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
                 self.retain_graph=False
-                semantic_grad = None #torch.autograd.grad(outputs=tv_loss, inputs=x_prev, retain_graph=self.retain_graph)[0]
+                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0] if semantic is not None else None
                 extrinsic_grad = None
             else:   # No hallucination
                 norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
@@ -547,9 +862,6 @@ class PosteriorSampling(ConditioningMethod):
         super().__init__(operator, noiser)
         self.scale = kwargs.get('scale', 1.0)
         self.scale_original = self.scale
-        self.c1 = 1e-3      # Sufficient decrease parameter
-        self.c2 = 0.8       # Curvature parameter
-        self.max_line_search = 5 #10  # Max iterations for line search
         self.alpha = self.scale_original
         self.best_ls = 1000
         self.loss_df = pd.DataFrame(columns=['Time', 'Loss'])
@@ -559,152 +871,88 @@ class PosteriorSampling(ConditioningMethod):
             writer = csv.writer(f)
             writer.writerow(["Epoch", "Step Size"])
         
-    def line_search(self, x_prev, x_t, x_0_hat, measurement, norm_grad, norm, t, **kwargs):
-        """
-        Perform line search to find step size (alpha) satisfying Wolfe conditions.
-        """
-        #self.alpha = self.scale_original  # Initial step size
-        alpha_min = 0.3 #1e-8  # Minimum step size
-        alpha_max = 1.0 #4.0*self.scale_original  # Maximum step size
-        scale = self.scale
-
-        # Original function and gradient values
-        norm_orig = norm #torch.linalg.norm(measurement - self.operator.forward(x_0_hat, **kwargs))
-        grad_orig = -1*norm_grad.view(-1).dot(norm_grad.view(-1))  # Norm of the gradient (directional derivative)
-
-        for _ in range(self.max_line_search):
-            # Apply step size to get new x_t
-            x_t_new = x_t - self.alpha * norm_grad
-            #x_t_new.requires_grad_()  # Ensure gradient tracking #############
-            
-            # Compute new norm and gradient
-            #with torch.no_grad():            
-            if t > 0:
-                x_0_hat_new = kwargs['func'](kwargs['model'], x_t_new, t-1, kwargs['clip_denoised'], kwargs['denoised_fn'], kwargs['cond_fn'], kwargs['model_kwargs'])['pred_xstart']
-            
-            # Ensure x_prev tracks gradients
-            #x_prev = x_prev.clone().detach().requires_grad_()  #############
-            
-            norm_grad_new, norm_grad_hallu_new, norm_new = self.grad_and_value(x_prev=x_t_new, x_0_hat=x_0_hat_new, measurement=measurement, t=t, **kwargs)
-           # assert len(torch.unique(norm_grad_new.cpu().detach())) > 1, f"Norm grad is zero: {torch.unique(norm_grad_new.cpu().detach())}"
-
-            # Check Wolfe conditions
-            # 1. Sufficient decrease (Armijo condition)
-            #print("NORM New, Norm, Grad")
-            #print(norm_new.detach().cpu(), norm_orig + self.c1 * self.alpha * grad_orig, grad_orig)
-           
-            if norm_new > norm_orig + self.c1 * self.alpha * grad_orig:
-                #print("Armjiho condition not met")
-                self.alpha *= 0.75  # Reduce step size
-                # print(norm_new, norm_orig + self.c1 * alpha * grad_orig)
-                if self.alpha < alpha_min:
-                    self.alpha = alpha_min
-                    break   # Break if minimum step size is reached
-                continue
-
-            # 2. Curvature condition
-            grad_new = torch.abs(-1*norm_grad_new.view(-1).dot(norm_grad.view(-1)))
-            #grad_new = torch.abs(-1*norm_grad_new.view(-1).dot(norm_grad.view(-1)))
-            #print("Grad NEW, Grad_Orig")
-            #print(torch.abs(grad_new), torch.abs(grad_orig))
-            if grad_new < self.c2 * torch.abs(grad_orig):
-                #print("Curvature condition not met")
-                self.alpha *= 1.5  # Increase step size
-                if self.alpha > alpha_max:
-                    self.alpha = alpha_max
-                    break   # Break if maximum step size is reached
-                continue
-
-            # If both conditions are satisfied, return the step size
-            return self.alpha
-
-        # If no suitable step size is found, return the minimum step size
-        return self.alpha #alpha_min
-    
-    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, patch_idx, extrinsic, **kwargs):
+    def conditioning(self, x_prev, x_t, x_0_hat, measurement, t, patch_idx, extrinsic, semantic, **kwargs):
         
         self.idx_lst = patch_idx
         self.mu = 0.1
-        self.hallu_weight = 0.001 #0.08 #05 #0.06 #0.01 # if self.mu < 1 else self.sclale * self.mu * 1.
-        self.semantic_weight = 0.1
+        self.hallu_weight = 0.007 #0.08 #05 #0.06 #0.01 # if self.mu < 1 else self.sclale * self.mu * 1.
+        self.semantic_weight = 0.007
         self.tv_coeff = 5e-5
         if t == 999:
             self.v_momentum = 0                      # velocity image, same shape as x
             self.beta_momentum = 0.9                 # momentum factor
 
-        #if (self.apply_mask is True):
-        #    assert self.hallu_weight >= self.scale * self.mu, f"Hallu Step {self.hallu_weight} must be bigger than {self.scale * self.mu}"
-
         self.hallu_mask = torch.zeros_like(measurement).to(device)
         for i in range(len(self.idx_lst)):
-            self.hallu_mask[0,0,self.idx_lst[i][0], self.idx_lst[i][1]] = 1.0
+            self.hallu_mask[0,:,self.idx_lst[i][0], self.idx_lst[i][1]] = 1.0
         
         # Compute initial gradient and norm
         #x_prev.requires_grad_()  ###############
-        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, hallu_mask = self.hallu_mask, extrinsic=extrinsic, hallu_weight=self.hallu_weight, **kwargs)
+        norm_grad, norm = self.grad_and_value(x_prev=x_prev, x_0_hat=x_0_hat, measurement=measurement, t=t, hallu_mask = self.hallu_mask, extrinsic=extrinsic, hallu_weight=self.hallu_weight, semantic=semantic, **kwargs)
 
         if (self.apply_mask == True):
             norm_grad, semantic_grad, norm_grad_hallu, extrinsic_grad = norm_grad[0], norm_grad[1], norm_grad[2], norm_grad[3]
             norm_nohallu, norm_hallu, pred_measurement = norm[0], norm[1], norm[2]
         else:
             norm_grad = norm_grad[0]
-            norm_nohallu = norm_grad.clone()
-            norm_hallu = norm_grad.clone()
+            norm_nohallu = norm[1]
+            norm_hallu = norm[2]
         #Add t and norm to dataframe
         self.loss_df = self.loss_df.append({'Time': t.cpu().numpy()[0], 'NoHalluLoss': norm_nohallu.detach().cpu().numpy(), 'HalluLoss': norm_hallu.detach().cpu().numpy()}, ignore_index=True)
         extrinsic_flag = True if extrinsic is not None else False
-        self.loss_df.to_csv(f'measurement_loss_timestep_extrinsic_{extrinsic_flag}.csv')
-        
-        # #there are multiple patches, so we need to loop through them
-        # self.hallu_weight = -0.1
-        # for i in range(len(idx_lst)):
-        #     #print("idx_lst: ", idx_lst[i][0].start, idx_lst[i][0].stop, idx_lst[i][1].start, idx_lst[i][1].stop)
-        #     hallu_mask[0,0,idx_lst[i][0], idx_lst[i][1]] = self.hallu_weight #-0.1
-        # #hallu_mask[0,0,idx_lst[0], idx_lst[1]] = -0.05 #-0.1
+        self.loss_df.to_csv(f'measurement_loss_timestep_extrinsic_{extrinsic_flag}_{self.hallu_weight}_final.csv')
+       
+        #Reduce step size to avoid artifact 
+        if t[0] <= 5:
+            self.scale = 0.2
+        else:
+            self.scale = self.scale_original
+
 
         if (self.apply_mask) and (extrinsic is None):# and (t <= 800): #Intrinsic hallucination
-            if t <= 10:
+            #t=10 for mri t=30 for mvtec
+            if t[0] <= 5:
                 self.hallu_weight = 0.0
                 self.mu = 0.0
                 self.tv_grad = 0.0
-                print("APPLY MASK INVOKED!")
+                self.semantic_weight = 0.0
+                #print("APPLY MASK INVOKED!")
 
             self.nohallu_mask = 1.0 - self.hallu_mask
             assert len(torch.unique(self.nohallu_mask)) == 2, f"There is no hallucination mask unique: {torch.unique(self.nohallu_mask,return_counts=True)}"
-            # #Soft thresholding with 0.1
-            #self.nohallu_mask = torch.where(self.nohallu_mask == 0.0, self.mu, self.nohallu_mask)
-            #norm_grad_hallu = norm_grad / (norm_grad.norm() + 1e-12)       # unit-norm to control scale
-            #self.v_momentum = self.beta_momentum * self.v_momentum + (1 - self.beta_momentum) * norm_grad_hallu    # momentum update
-            x_t = x_t - norm_grad * self.scale * self.nohallu_mask + norm_grad_hallu * self.hallu_weight * self.hallu_mask
+
+            if semantic is None:
+                self.semantic_weight = 0.0
+                x_t = x_t - norm_grad * self.scale * self.nohallu_mask + norm_grad_hallu * self.hallu_weight * self.hallu_mask
+            else:
+                x_t = x_t - norm_grad * self.scale * self.nohallu_mask + norm_grad_hallu * self.hallu_weight * self.hallu_mask + semantic_grad * self.semantic_weight * self.hallu_mask 
+        
         elif (extrinsic is not None) and (self.apply_mask): #Extrinsic hallucination
-            if t <= 10:
+
+            self.nohallu_mask = 1.0 - self.hallu_mask
+            #t=10 for mri t=30 for brain
+            if t[0] <= 10:
                 self.hallu_weight = 0.0
                 self.semantic_weight = 0.0
-                
-           
-            #    self.mu = 0.0
-            #    self.tv_grad = 0.0
-            #    print("APPLY MASK INVOKED!")
-            self.nohallu_mask = 1.0 - self.hallu_mask
-            if t<=10:
                 # Apply soft thresholding to reduce step size in hallucination regions
                 self.nohallu_mask[self.nohallu_mask == 0.0] = 0.1   
          
             assert len(torch.unique(self.nohallu_mask)) == 2, f"There is no hallucination mask unique: {torch.unique(self.nohallu_mask,return_counts=True)}"
             #norm_grad_hallu = norm_grad / (norm_grad.norm() + 1e-12)       # unit-norm to control scale
             #self.v_momentum = self.beta_momentum * self.v_momentum + (1 - self.beta_momentum) * norm_grad_hallu    # momentum update
-            if t <= 10:
-                x_t = x_t - norm_grad * self.scale + semantic_grad * self.semantic_weight * self.hallu_mask +extrinsic_grad * self.hallu_weight * self.hallu_mask 
-            else:
+            if t[0] <= 10:
                 x_t = x_t - norm_grad * self.scale * self.nohallu_mask
+            else:
+                if semantic is None:
+                    self.semantic_weight = 0.0
+                    semantic_grad = 0.0
+                x_t = x_t - norm_grad * self.scale + semantic_grad * self.semantic_weight * self.hallu_mask +extrinsic_grad * self.hallu_weight * self.hallu_mask 
+        
         else:
             x_t -= norm_grad * self.scale
-        #if t == 0:
-            #np.save(f"pred_measurement_{self.cnt}.npy", pred_measurement.detach().cpu().numpy())
-         #   self.cnt += 1
-        #if t > 0:
-        return x_t, norm
-        
+
+        return x_t, norm, self.hvm_flag
+
 @register_conditioning_method(name='ps+')
 class PosteriorSamplingPlus(ConditioningMethod):
     def __init__(self, operator, noiser, **kwargs):

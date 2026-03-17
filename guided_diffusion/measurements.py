@@ -171,10 +171,10 @@ class GaussialBlurOperator(LinearOperator):
         
         maxi,mini = data.max(), data.min()
         # Normalize
-        # data = (data - mini) / (maxi - mini)
+        #data = (data - mini) / (maxi - mini)
         data = self.gamma_transform(data, 0.7) #0.8
         # # Unnormalize
-        # data = data * (maxi - mini) + mini
+        #data = data * (maxi - mini) + mini
         
         # Downsample using F.interpolate
         assert data.shape[-1] == 256, f"img must be shape 256 but got {data.shape[-1]}"

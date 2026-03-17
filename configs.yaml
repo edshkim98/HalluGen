@@ -8,8 +8,10 @@ std: 362.1817760568698
 line_search: False
 fine_tune: False
 use_lbfgs: False
-extrinsic: True
+extrinsic: False
+semantic: False
 interpolate_nohallu: True
+perturb_measurement: False
 
 data:
   return_id: True
@@ -24,7 +26,7 @@ measurement:
   operator:
     name: 'gaussian_blur' #'noise'
     kernel_size: 11 #11 #5 #61
-    intensity: 1.0  #3.0
+    intensity: 2.0  #2.0
   
   noise: 
     name: 'gaussian'
