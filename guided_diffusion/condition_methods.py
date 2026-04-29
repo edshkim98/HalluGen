@@ -26,8 +26,6 @@ import timm
 from scipy.ndimage import label
 
 sys.path.append('/SAN/medic/IQT_ScoreMatching/SAM-Med2D')
-#sys.path.append('/SAN/medic/IQT_ScoreMatching/segment-anything')
-
 from segment_anything import sam_model_registry
 
 warnings.filterwarnings("ignore")
@@ -491,16 +489,8 @@ class PerceptualLoss(nn.Module):
         input_features = self.feature_extractor(input_image)
         target_features = self.feature_extractor(target_image)
        
-        feat_shape = input_features[0]
-        print(feat_shape.shape)
-
-        # Calculate perceptual loss using L2 norm of feature differences
-        #loss = 0.0
-        #for input_feat, target_feat in zip(input_features, target_features):
-        #    loss += torch.mean((input_feat - target_feat) ** 2) #loss += torch.linalg.norm(input_feat - target_feat)
         diff = target_features[0] - input_features[0]
-
-        return diff, feat_shape
+        return diff, input_features[0]
 
 def register_conditioning_method(name: str):
     def wrapper(cls):
@@ -789,23 +779,24 @@ class ConditioningMethod(ABC):
                 semantic_loss = torch.linalg.norm(feats) #torch.mean((semantic_loss)**2)
                 assert semantic_loss > 0, f"Loss is zero: {torch.unique(mask_ds)}, {semantic_loss}"
             
-            if (extrinsic is not None) and self.apply_mask: # Extrinsic hallucination
-                self.retain_graph=True
-                norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, retain_graph=self.retain_graph)[0]
-                self.retain_graph=False
-                extrinsic_grad = torch.autograd.grad(outputs=extrinsic_loss, inputs=x_0_hat, retain_graph=self.retain_graph)[0]
-                self.retain_graph=False
-                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0] if semantic is not None else None
+            if (extrinsic is not None) and self.apply_mask:  # Extrinsic hallucination
+                norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev, retain_graph=True)[0]
+                extrinsic_grad = torch.autograd.grad(outputs=extrinsic_loss, inputs=x_0_hat)[0]
+                semantic_grad = (
+                    torch.autograd.grad(outputs=semantic_loss, inputs=x_prev)[0]
+                    if semantic is not None else None
+                )
                 norm_grad_hallu = None
-            
-            elif (extrinsic is None) and self.apply_mask: # Intrinsic hallucination
-                self.retain_graph=True
-                norm_grad = torch.autograd.grad(outputs=norm_nohallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
-                norm_grad_hallu = torch.autograd.grad(outputs=norm_hallu, inputs=x_prev, retain_graph=self.retain_graph)[0]
-                self.retain_graph=False
-                semantic_grad = torch.autograd.grad(outputs=semantic_loss, inputs=x_prev, retain_graph=self.retain_graph)[0] if semantic is not None else None
+
+            elif (extrinsic is None) and self.apply_mask:  # Intrinsic hallucination
+                norm_grad = torch.autograd.grad(outputs=norm_nohallu, inputs=x_prev, retain_graph=True)[0]
+                norm_grad_hallu = torch.autograd.grad(outputs=norm_hallu, inputs=x_prev, retain_graph=True)[0]
+                semantic_grad = (
+                    torch.autograd.grad(outputs=semantic_loss, inputs=x_prev)[0]
+                    if semantic is not None else None
+                )
                 extrinsic_grad = None
-            else:   # No hallucination
+            else:  # No hallucination
                 norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
                 semantic_grad = None
                 norm_grad_hallu = None
@@ -864,7 +855,7 @@ class PosteriorSampling(ConditioningMethod):
         self.scale_original = self.scale
         self.alpha = self.scale_original
         self.best_ls = 1000
-        self.loss_df = pd.DataFrame(columns=['Time', 'Loss'])
+        self._loss_records = []
         self.cnt = 0
         self.csv_file = "./line_search_stepsize.csv"
         with open(self.csv_file, "w", newline="") as f:
@@ -897,10 +888,15 @@ class PosteriorSampling(ConditioningMethod):
             norm_grad = norm_grad[0]
             norm_nohallu = norm[1]
             norm_hallu = norm[2]
-        #Add t and norm to dataframe
-        self.loss_df = self.loss_df.append({'Time': t.cpu().numpy()[0], 'NoHalluLoss': norm_nohallu.detach().cpu().numpy(), 'HalluLoss': norm_hallu.detach().cpu().numpy()}, ignore_index=True)
-        extrinsic_flag = True if extrinsic is not None else False
-        self.loss_df.to_csv(f'measurement_loss_timestep_extrinsic_{extrinsic_flag}_{self.hallu_weight}_final.csv')
+        extrinsic_flag = extrinsic is not None
+        self._loss_records.append({
+            'Time': t.cpu().numpy()[0],
+            'NoHalluLoss': norm_nohallu.detach().cpu().numpy(),
+            'HalluLoss': norm_hallu.detach().cpu().numpy(),
+        })
+        pd.DataFrame(self._loss_records).to_csv(
+            f'measurement_loss_timestep_extrinsic_{extrinsic_flag}_{self.hallu_weight}_final.csv', index=False
+        )
        
         #Reduce step size to avoid artifact 
         if t[0] <= 5:

@@ -18,7 +18,6 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 import yaml
-import torch
 import tqdm
 import glob
 from torch.utils.data import DataLoader
@@ -26,10 +25,7 @@ from guided_diffusion.image_datasets import IQTDataset
 from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.condition_methods import get_conditioning_method
 
-import matplotlib.pyplot as plt
 import time
-from torchvision.transforms import Resize
-from PIL import Image
 from guided_diffusion.test_util import select_patch
 
 
@@ -41,10 +37,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-def load_data_custom(data_loader):
-    while True:
-        yield from data_loader
 
 def compute_patch_entropy(patch: torch.Tensor, num_bins: int = 256, eps: float = 1e-10, zero2two: bool = True) -> torch.Tensor:
     """
@@ -109,23 +101,18 @@ def main():
     #import sys
     #sys.exit()   # terminate the program
 
-    save_path = '/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/Intrinsic_hallu_0.002_interpolation_t200_multi_1.4entropy_hvm_final'
+    save_path = args.save_path
 
-    #lst_files = ['994273', '993675', '992774', '992673', '991267', '990366', '989987', '987983', '987074', '984472', '983773', '979984', '978578', '973770', '972566', '971160', '970764', '969476', '966975', '965771', '965367', '962058', '969574', '958976', '957974', '955465', '953764', '947668', '943862', '942658', '937160', '933253', '932554', '930449', '929464', '927359', '926862', '923755', '922854', '919966', '917558', '917255', '912477', '911849', '910443', '910241', '908860', '907656', '905147', '904044']
-    #lst_files = lst_files[:10]
-    lst_files = ['996782', '995174', '994273', '993675', '992774', '992673', '991267', '990366', '989987', '987983', '987074', '984472', '983773', '979984', '978578', '973770', '972566', '971160', '970764', '969476', '966975', '965771', '965367', '962058', '959574', '958976', '957974', '955465', '953764','952863', '951457', '947668', '943862', '942658', '937160', '933253', '932554', '930449', '929464', '927359', '926862', '923755', '922854', '919966', '917558', '917255', '912447', '911849', '910443', '910241', '908860', '907656', '905147', '904044', '902242', '901442', '901139', '901038']
-    lst_files = lst_files#[50:]
-    #print(lst_files)
+    lst_files = ['996782', '995174', '994273', '993675', '992774', '992673', '991267', '990366', '989987', '987983', '987074', '984472', '983773', '979984', '978578', '973770', '972566', '971160', '970764', '969476', '966975', '965771', '965367', '962058', '959574', '958976', '957974', '955465', '953764', '952863', '951457', '947668', '943862', '942658', '937160', '933253', '932554', '930449', '929464', '927359', '926862', '923755', '922854', '919966', '917558', '917255', '912447', '911849', '910443', '910241', '908860', '907656', '905147', '904044', '902242', '901442', '901139', '901038']
     
     save_files_pred = {i: [] for i in lst_files}
     save_files_gt = {i: [] for i in lst_files}
     save_files_lr = {i: [] for i in lst_files}
     
-    data_dir = '/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/synth_gt/' 
-    files = glob.glob(data_dir + '/*/gt*.npy')
-    #print(files[:5])
+    data_dir = args.data_dir
+    files = glob.glob(os.path.join(data_dir, '*/gt*.npy'))
     files_new = []
-    lst_files_nohallu = os.listdir('/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/dps_nohallu_t200/')
+    lst_files_nohallu = os.listdir(args.nohallu_dir)
     for f in files:
         if (f.split('/')[-2] in lst_files_nohallu) and (f.split('/')[-2] in lst_files):
             files_new.append(f)
@@ -135,23 +122,19 @@ def main():
 
     # Check if already done
     try:
-        files_exist = os.listdir(save_path)
-        print(f"Files exist: {len(files_exist)}")
+        files_exist = set(os.listdir(save_path))
+        print(f"Files already saved: {len(files_exist)}")
         files_new = []
-        for i in files:
-            fname = i.split('/')[-3]
-            existing = True if fname in files_exist else False
-            if existing:
-                print(f"Skipping {fname}...")
+        for f in files:
+            subject_id = f.split('/')[-3]
+            if subject_id in files_exist:
+                print(f"Skipping {subject_id}...")
             else:
-                files_new.append(i)
-                print(fname)
-
+                files_new.append(f)
         files = files_new
-        print(f"Files after checking existing: {len(files)}")
-        print(files)
-    except:
-        print("No file exist so run all")
+        print(f"Files remaining: {len(files)}")
+    except FileNotFoundError:
+        print("Save directory not found — processing all files")
 
     dataset = IQTDataset(files, configs = configs, return_id=configs['data']['return_id'])
     print(f"Files: {len(files)} Dataset size: {len(dataset)}")
@@ -169,9 +152,8 @@ def main():
     noiser = get_noise(**measure_config['noise'])
     logger.info(f"Operation: {measure_config['operator']['name']} / Noise: {measure_config['noise']['name']}")
  
-     # Working directory
-    save_dir = '/cluster/project0/IQT_Nigeria/skim/diffusion_inverse/guided-diffusion/results/'
-    out_path = os.path.join(save_dir, measure_config['operator']['name'])
+    # Working directory
+    out_path = os.path.join(args.results_dir, measure_config['operator']['name'])
     os.makedirs(out_path, exist_ok=True)
     for img_dir in ['input', 'recon', 'progress', 'label']:
         os.makedirs(os.path.join(out_path, img_dir), exist_ok=True)
@@ -203,7 +185,7 @@ def main():
             model_kwargs["y"] = classes
             
         assert ref_img.shape[0] == 1, f"batch size must be 1 but got {ref_img.shape[0]}"
-        cond_img = np.load(f'/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/dps_nohallu_t200/{data_dict["file_id"][0]}/pred_{data_dict["slice_idx"][0]}_axial.npy')
+        cond_img = np.load(os.path.join(args.nohallu_dir, data_dict["file_id"][0], f'pred_{data_dict["slice_idx"][0]}_axial.npy'))
         cond_img = torch.tensor(cond_img, device=device).unsqueeze(0)    
         ref_img = ref_img.to(device)
         # Load U-Net output
@@ -360,8 +342,12 @@ def create_argparser():
         num_samples=1,
         batch_size=1,
         use_ddim=False,
-        model_path="/cluster/project0/IQT_Nigeria/skim/diffusion_inverse/guided-diffusion/logs_large_zero2two_HCPMoreSlice2025/model360000.pt",)
-#120000.pt",    )
+        model_path="/cluster/project0/IQT_Nigeria/skim/diffusion_inverse/guided-diffusion/logs_large_zero2two_HCPMoreSlice2025/model360000.pt",
+        save_path="/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/Intrinsic_hallu_0.002_interpolation_t200_multi_1.4entropy_hvm_final",
+        data_dir="/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/synth_gt",
+        nohallu_dir="/SAN/medic/IQT_ScoreMatching/skim/HalluBench_final_full/final/dps_nohallu_t200",
+        results_dir="/cluster/project0/IQT_Nigeria/skim/diffusion_inverse/guided-diffusion/results",
+    )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)

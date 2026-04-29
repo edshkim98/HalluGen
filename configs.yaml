@@ -1,13 +1,11 @@
-ProjectName: 'CrossbatchLinear_96_4x/'
-Model: 'model/'  
-File: 'train_log/'
-Results: './results/'
+# Normalisation applied to model outputs (zero2two | zscore | minmax)
 norm: 'zero2two'
-mean: 259.3117656881453 
-std: 362.1817760568698 
+mean: 259.3117656881453
+std: 362.1817760568698
+
+# Generation flags
 line_search: False
 fine_tune: False
-use_lbfgs: False
 extrinsic: False
 semantic: False
 interpolate_nohallu: True
