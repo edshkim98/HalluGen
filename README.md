@@ -167,6 +167,7 @@ If you find this work useful, please cite:
 
 ```bibtex
 @inproceedings{hallugen2026,
+  author = { Kim, Seunghoi AND  Jin, Chen AND Tregidgo, Henry F. J. AND Figini, Matteo AND Alexander, Daniel C.},
   title     = {HalluGen: Synthesizing Realistic and Controllable Hallucinations for Evaluating Image Restoration},
   booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
   year      = {2026},
